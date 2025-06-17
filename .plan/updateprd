@@ -1,0 +1,234 @@
+
+Truss Platform: Task Improvement & Refinement List
+Overall Status: Excellent Foundation.
+
+The current implementation is robust and well-tested at the unit level. The following tasks are focused on refining workflow-level logic, improving API contracts, and enhancing integration testing to move from a collection of well-tested units to a fully integrated, production-ready system.
+
+Task 1: Refine Workflow Cancellation Logic (High Priority)
+
+HLD Goal: Ensure cancellations are handled gracefully and are semantically aligned with Temporal's best practices for clear observability.
+
+LLD Issue: The workflow currently raises a generic ApplicationError upon a cancellation signal. While functional, this is less idiomatic than using asyncio.CancelledError, which Temporal recognizes and displays specifically as a "Cancelled" status in its UI.
+
+Detailed Fix (truss/workflows/agent_workflow.py):
+
+Modify the exception raised in the main loop:
+
+# Current:
+if self.cancellation_requested:
+    raise ApplicationError("Workflow cancelled via signal", non_retryable=True)
+
+# To Be:
+if self.cancellation_requested:
+    raise asyncio.CancelledError("Workflow cancelled via signal.")
+
+
+Update the exception handling block:
+
+# Current:
+except ApplicationError as exc:
+    error_message = str(exc)
+    final_status = "cancelled" if "cancelled" in error_message.lower() else "errored"
+    raise
+
+# To Be:
+except asyncio.CancelledError as exc:
+    # This block is now specifically for graceful cancellations.
+    error_message = str(exc)
+    final_status = "cancelled"
+    # It's crucial to re-raise so Temporal's machinery marks the workflow correctly.
+    raise
+except ApplicationError as exc:
+    # This block now only handles non-retryable application logic errors.
+    error_message = str(exc)
+    final_status = "errored"
+    raise
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Testing Requirements:
+
+New Test Case in tests/test_temporal_agent_workflow_runtime.py:
+
+Create a test that starts the workflow, sends the request_cancellation signal, and then asserts that the workflow execution result is a temporalio.exceptions.CancelledError. This requires using the temporalio.testing.WorkflowEnvironment to run the workflow end-to-end.
+
+The finally block should still execute, so you'll need to mock the FinalizeRun activity and assert that it was called with status='cancelled'.
+
+Task 2: Align API Contract with Workflow Input (High Priority)
+
+HLD Goal: Maintain a clean, predictable data contract between the API layer and the Workflow layer.
+
+LLD Issue: The /sessions/{session_id}/runs API endpoint accepts {"message": "string"}. The workflow's execute method expects an AgentWorkflowInput object where user_message is a Message object, not a string. This causes a runtime validation error.
+
+Detailed Fixes:
+
+Modify API Input Model (truss/api/main.py):
+
+# In truss/api/main.py
+class RunCreateRequest(BaseModel):
+    message: str # This is correct for a simple API.
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Modify Workflow Input Model (truss/data_models.py):
+
+# In truss/data_models.py
+class AgentWorkflowInput(BaseModel):
+    session_id: str
+    # Change this field to reflect the raw input from the API.
+    user_message_text: str = Field(..., alias="user_message") # Use alias for mapping
+    run_id: Optional[str] = None
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Update API Endpoint to pass correct structure (truss/api/main.py):
+
+# In truss/api/main.py, start_run function
+await _temporal_client.start_workflow(
+    TemporalAgentExecutionWorkflow.execute,
+    id=workflow_id,
+    task_queue="truss-agent-queue",
+    # Pass the raw string as defined in the updated AgentWorkflowInput
+    args=[{"session_id": session_id, "user_message": payload.message}],
+)
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Update Workflow Logic to construct Message object (truss/workflows/agent_workflow.py):
+
+# In truss/workflows/agent_workflow.py, execute function
+# ...
+# 3. Persist initial user message as *RunStep*
+user_message_obj = Message(role="user", content=input.user_message_text)
+await workflow.execute_activity(
+    "CreateRunStep",
+    args=[run_id, user_message_obj], # Pass the newly created object
+    ...
+)
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Testing Requirements:
+
+Modify tests/test_api_runs.py: Update the payload to match the RunCreateRequest model.
+
+Modify tests/test_temporal_agent_workflow_initialization.py: Ensure the AgentWorkflowInput used in the test now passes user_message_text instead of a Message object. The test should verify that the CreateRunStep activity is called with a correctly constructed Message object.
+
+Task 3: Implement Full End-to-End Integration Test (Medium Priority)
+
+HLD Goal: Verify that all components (API, Workflow, Activities, DB) work together correctly for a complete user journey.
+
+LLD Issue: The current tests are excellent unit/component tests but do not cover a full "happy path" from an API call to a final workflow result.
+
+Detailed Fix (tests/test_integration.py - New File):
+
+Create a new test file that uses pytest-asyncio.
+
+This test will use temporalio.testing.WorkflowEnvironment to run an in-memory Temporal service.
+
+It will also use fastapi.testclient.TestClient for the API.
+
+Test Steps:
+
+Setup: Start the test WorkflowEnvironment. Run a test worker connected to this environment. Seed the in-memory SQLite database with an AgentConfig.
+
+API Call: Use the TestClient to call POST /sessions to create a session.
+
+Trigger Workflow: Call POST /sessions/{session_id}/runs to start the workflow.
+
+Mock External Calls: The LLMStreamPublish and ExecuteTool activities should be mocked to return predictable data (e.g., a simple text response, or a tool call request).
+
+Assert Outcome:
+
+Wait for the workflow to complete using await client.get_workflow_handle(workflow_id).result().
+
+Assert that the workflow output status is 'completed'.
+
+Connect to the in-memory database and verify that the runs and run_steps tables contain the expected records (user message, assistant response).
+
+Testing Requirements: This is the testing requirement. It validates the integration of all other units.
+
+Task 4: Enhance LLM Activity with Dependency Injection (Low Priority - Refactoring)
+
+HLD Goal: Improve testability and resource management for core activities.
+
+LLD Issue: llm_activity.py creates its own PostgresStorage instance. This makes it difficult to mock the database during testing and is less efficient than sharing a connection pool managed by the worker.
+
+Detailed Fixes:
+
+Refactor llm_activities.py to be a class:
+
+# In truss/activities/llm_activities.py
+class LLMActivities:
+    def __init__(self, storage: PostgresStorage):
+        self._storage = storage
+
+    @activity.defn(name="LLMStreamPublish")
+    async def llm_activity(self, ...):
+        # ... existing logic ...
+        # Use the injected storage instance
+        await to_thread.run_sync(
+            self._storage.create_run_step_from_message,
+            ...
+        )
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Update Worker Setup (truss/run_worker.py):
+
+# In truss/run_worker.py
+# ...
+storage = PostgresStorage.from_database_url(db_url)
+storage_activities = StorageActivities(storage)
+llm_activities = LLMActivities(storage) # Create instance with shared storage
+
+activities = [
+    *_collect_storage_activity_fns(storage_activities),
+    llm_activities.llm_activity, # Register the method
+    execute_tool_activity,
+]
+# ...
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+
+Update Workflow (truss/workflows/agent_workflow.py):
+
+No change is needed in the workflow itself, as it calls the activity by its registered name ("LLMStreamPublish").
+
+Testing Requirements:
+
+Modify tests/test_llm_activity*.py:
+
+The tests will no longer need to patch PostgresStorage.from_database_url.
+
+Instead, they can instantiate a mock _DummyStorage and pass it directly to the LLMActivities constructor: llm_act_instance = LLMActivities(storage=dummy_storage).
+
+The test will then call await llm_act_instance.llm_activity(...). This is a much cleaner and more direct way to test the activity's logic in isolation.

@@ -1,0 +1,211 @@
+
+Product Requirements Document: Truss - A Durable LLM Agent Platform
+Field	Value
+Document Status	DRAFT
+Version	1.0
+Author	System AI
+Last Updated	[Current Date]
+1. Introduction & Vision
+
+1.1. Problem: Building LLM-powered agents that can perform complex, multi-step tasks is fraught with challenges. Developers must manually manage state, handle intermittent API failures from LLMs and tools, orchestrate long-running processes, and lack visibility into the agent's "thought process." This leads to brittle, unreliable, and unscalable applications.
+
+1.2. Vision: To provide a robust, scalable, and observable platform for executing LLM agents. Truss will empower developers to define an agent's logic and tools as simple Python code, while the underlying platform, powered by Temporal, guarantees that the execution is durable, fault-tolerant, and stateful by default.
+
+1.3. Core Concept: Truss defines an agent's execution as a Durable Workflow. Every step—from calling an LLM, to using a tool, to waiting for human input—is an atomic, retryable action orchestrated by Temporal. This abstracts away the complexity of state management and failure recovery, allowing developers to focus solely on the agent's business logic.
+
+2. Goals & Objectives
+
+2.1. Goals
+
+Reliability: Agent executions must run to completion, even in the face of worker crashes, network failures, or transient LLM API errors.
+
+Observability: Provide clear, real-time visibility into every step of a running agent's execution, including its history, state, and pending tasks.
+
+Developer Experience: Offer a simple, Python-native interface for defining agents, tools, and workflows without requiring deep expertise in distributed systems.
+
+Scalability: The platform must be able to handle thousands of concurrent agent executions efficiently.
+
+Flexibility: Allow seamless integration with any LLM provider via LiteLLM and support arbitrary custom tools.
+
+2.2. Non-Goals (for V1)
+
+This is not a UI/Frontend application. Truss provides the backend engine and APIs.
+
+This is not a new LLM provider. We are an orchestration layer.
+
+We will not provide a managed, hosted version of the platform in V1.
+
+3. System Architecture & Design
+3.1. High-Level Architecture Diagram
+
+A user request flows through the following components:
+
+Client Application -> [API Endpoint] -> [Temporal Client] -> [Temporal Server Cluster] -> [Truss Worker]
+
+The Truss Worker executes the workflow, which in turn calls activities that interact with:
+
+Postgres Database (for durable state history)
+
+Redis (for volatile UI streaming)
+
+LiteLLM (for any LLM API)
+
+External Tool APIs (e.g., Google Search, Stock API)
+
+3.2. File System Structure
+
+The codebase will be organized as discussed, reflecting a clean separation of concerns:
+
+truss/
+├── __init__.py
+├── activities/
+│   ├── llm_activities.py      # Activity for calling LLMs via LiteLLM
+│   ├── storage_activities.py  # Activities for all DB interactions
+│   └── tool_activities.py     # Activity for executing agent tools
+├── core/
+│   ├── __init__.py
+│   ├── models/
+│   │   └── base.py            # SQLAlchemy DB models (AgentConfig, Run, RunStep)
+│   └── storage/
+│       └── postgres_storage.py # DB connection and session logic
+├── workflows/
+│   ├── __init__.py
+│   ├── agent_workflow.py      # The core TemporalAgentExecutionWorkflow
+│   └── base.py                # Base classes and shared logic
+└── data_models.py             # Pydantic models for API/Workflow data contracts
+
+3.3. Database Schema (Postgres)
+
+The database is the source of truth for historical data.
+
+Table	Columns	Description
+agent_configs	id (UUID, PK), name (String), system_prompt (Text), llm_config (JSONB), tools (JSONB), created_at	Defines an agent's personality, model, and capabilities.
+run_sessions	id (UUID, PK), agent_config_id (FK), user_id (String), created_at	A long-lived conversation thread.
+runs	id (UUID, PK), session_id (FK), status (String), error (Text), created_at, updated_at	A single user-to-agent exchange. Status: running, completed, failed, cancelled.
+run_steps	id (UUID, PK), run_id (FK), role (String), content (Text), tool_calls (JSONB), tool_call_id (String), created_at	A single message. role is user, assistant, or tool. CRITICAL: This table must only store complete messages.
+
+Indexes will be placed on all Foreign Keys (session_id, run_id) for fast lookups.
+
+3.4. Configuration Management
+
+Agent configurations are managed via the agent_configs table.
+
+An AgentConfig defines everything about an agent:
+
+The LLM to use (e.g., gpt-4o, claude-3-opus-20240229).
+
+Model parameters (temperature, max_tokens).
+
+The system prompt.
+
+A JSON array of ToolDefinition objects that the agent is allowed to use.
+
+4. Core Features & Requirements
+4.1. The TemporalAgentExecutionWorkflow
+
+This is the heart of the system.
+
+Orchestration: It will execute the full "Reasoning -> Action" loop.
+
+Logic:
+
+Initialize: Create Run and RunStep for the user's input via activities.
+
+Load Context: Fetch agent config and conversation history (RunSteps) via activities.
+
+LLM Call: Execute the llm_activity.
+
+Decision:
+
+If the response is text, finalize the Run and complete.
+
+If the response contains tool_calls, execute the execute_tool_activity for each tool, persist the results, and loop back to step 3.
+
+State: The workflow will hold the in-memory messages array for the current Run. The DB holds the permanent record.
+
+4.2. Tool Integration & Execution
+
+Definition: Tools are defined in the AgentConfig using a format compatible with OpenAI's function calling.
+
+Execution: A single, generic execute_tool_activity will act as a router. It receives a ToolCall object, looks up the function name, and executes the corresponding Python code.
+
+Sample Tools: The system will ship with two example tool implementations:
+
+web_search
+
+Definition: {"name": "web_search", "description": "Search the web for information", "parameters": {"query": "string"}}
+
+Implementation: An activity that calls an external search API (e.g., Serper, Google Search API) and returns a snippet of results.
+
+get_stock_price
+
+Definition: {"name": "get_stock_price", "description": "Get the latest price for a stock ticker", "parameters": {"ticker_symbol": "string"}}
+
+Implementation: An activity that calls a financial data API (e.g., Alpha Vantage) and returns the current price.
+
+4.3. Real-time Streaming & Durability
+
+The Problem: We need real-time UI updates without storing partial, incomplete data in our primary database.
+
+The Solution:
+
+llm_activity Behavior:
+
+When streaming from LiteLLM, it will immediately publish each raw chunk to a Redis Pub/Sub channel (e.g., stream:{session_id}).
+
+Simultaneously, it will accumulate the full message in memory.
+
+Only upon successful completion of the entire stream, the activity will write the single, complete RunStep to the Postgres database.
+
+This ensures the UI is responsive, while the database remains perfectly consistent and durable. If the worker crashes mid-stream, no partial data is saved, and the activity will be retried by Temporal from the beginning.
+
+4.4. Workflow Control via Signals
+
+Human-in-the-Loop: A provide_human_feedback(feedback: str) signal will allow a workflow to pause (workflow.wait_condition), await human input, and then resume execution with the new information.
+
+Dynamic Instruction: An update_agent_instructions(instructions: str) signal can be used to modify the agent's behavior for the next LLM call within the same workflow run.
+
+Pause/Resume: pause_execution() and resume_execution() signals will allow administrators to temporarily halt and continue a workflow.
+
+4.5. Cancellation & Error Handling
+
+Graceful Cancellation: A request_cancellation() signal will set a flag in the workflow. The workflow will check this flag at the start of its main loop. If true, it will enter a cleanup phase, call finalize_execution_run_activity to update the run status to cancelled, and then terminate gracefully.
+
+Retry Policies: All activities will have defined RetryPolicy. I/O-heavy activities like LLM and tool calls will have exponential backoff policies to handle transient failures.
+
+Saga Pattern for Compensation: If an activity fails permanently (all retries exhausted), the workflow's try...except ActivityError block will catch it, log the error, and call finalize_execution_run_activity to mark the run as failed with a descriptive error message.
+
+5. API Specification (RESTful Endpoints)
+Method	Endpoint	Description	Body
+POST	/sessions	Create a new conversation session.	{ "agent_id": "uuid", "user_id": "string" }
+POST	/sessions/{session_id}/runs	Send a new message to the agent. This starts the TemporalAgentExecutionWorkflow.	{ "message": "string" }
+GET	/sessions/{session_id}/history	Get the full history of a conversation.	N/A
+POST	/workflows/{workflow_id}/signal/request_cancellation	Request to cancel a running workflow.	{}
+POST	/workflows/{workflow_id}/signal/provide_human_feedback	Provide input to a waiting workflow.	{ "feedback": "string" }
+6. Worker Setup & Deployment
+
+Worker Process: A Python process will be responsible for running the Truss Worker.
+
+Initialization:
+
+Establish a connection to the Temporal Server.
+
+Initialize a Postgres connection pool.
+
+Inject the storage dependency into the storage_activities module.
+
+Create a temporalio.worker.Worker instance, registering all defined Workflows and Activities.
+
+The worker will connect to the specified TaskQueue and begin polling for work.
+
+Deployment: The worker process should be containerized (e.g., Docker) and deployed as a scalable service (e.g., on Kubernetes or ECS). The number of worker replicas can be scaled based on load.
+
+7. Success Metrics
+
+Reliability: Workflow success rate > 99.9%.
+
+Performance: P95 latency for a single-turn, non-tool response < 3 seconds (excluding LLM inference time).
+
+Adoption: Number of active agents and daily executed runs.
+
+Cost Efficiency: Track and log token usage and cost for every LLM call.

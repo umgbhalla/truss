@@ -1,0 +1,27 @@
+[project]
+name = "truss"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm[proxy]>=1.72.4",
+    "temporalio>=1.12.0",
+    "pydantic>=2.5",
+    "pytest>=8.2",
+    "SQLAlchemy>=2.0",
+    "alembic>=1.16",
+    "anyio>=4.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "google-auth>=2.40.3",
+    "google-auth-httplib2>=0.2.0",
+    "google-api-python-client>=2.172.0",
+    "prisma>=0.15.0",
+    "openai-agents>=0.0.7",
+    "ipywidgets>=8.1.7",
+    "pip>=25.1.1",
+    "mcp[protocol]>=1.5.0",
+]

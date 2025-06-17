@@ -1,0 +1,310 @@
+
+Technical Implementation Guide: Truss Durable Agent Platform
+
+This guide provides a class-by-class, function-by-function implementation plan.
+
+1. Database & Data Models (The Foundation)
+
+The design remains as specified in the HLD. The key principle is the separation between Pydantic data_models (for transient data contracts) and SQLAlchemy core/models (for persistent storage). This decoupling is non-negotiable for a clean architecture.
+
+2. Activities: The Resilient "Work" Layer
+
+Activities are designed to be atomic and idempotent where possible. They handle all I/O.
+
+2.1. storage_activities.py - The Durable Record Keepers
+
+These activities are the only ones that should write to the primary Postgres database.
+
+# truss/activities/storage_activities.py
+from temporalio import activity
+from truss.core.storage.postgres_storage import PostgresStorage # Assumes this class handles DB sessions
+from truss.data_models import Message, AgentMemory, AgentConfig
+# ... other imports ...
+
+class StorageActivities:
+    def __init__(self, storage: PostgresStorage):
+        self.storage = storage
+
+    @activity.defn(name="CreateRun")
+    async def create_run(self, session_id: UUID) -> UUID:
+        """Creates a new Run record and returns its ID."""
+        run = await self.storage.create_run(session_id=session_id)
+        return run.id
+
+    @activity.defn(name="CreateRunStep")
+    async def create_run_step(self, run_id: UUID, message: Message) -> UUID:
+        """Persists a Pydantic Message as a RunStep record."""
+        # This activity is critical. It translates the transient Message
+        # into a permanent SQLAlchemy RunStep model and saves it.
+        run_step = await self.storage.create_run_step_from_message(run_id=run_id, message=message)
+        return run_step.id
+
+    @activity.defn(name="GetRunMemory")
+    async def get_run_memory(self, session_id: UUID) -> AgentMemory:
+        """Fetches all RunSteps for a session and converts them to AgentMemory."""
+        run_steps = await self.storage.get_steps_for_session(session_id=session_id)
+        messages = [step.to_pydantic_message() for step in run_steps] # Assume a conversion method
+        return AgentMemory(messages=messages)
+
+    @activity.defn(name="FinalizeRun")
+    async def finalize_run(self, run_id: UUID, status: str, error_message: Optional[str] = None):
+        """Updates the final status of a Run. This is a critical compensation step."""
+        await self.storage.update_run_status(run_id=run_id, status=status, error=error_message)
+
+2.2. llm_activity.py - The Fault-Tolerant LLM Interface
+
+This is the most complex activity, designed for maximum resilience.
+
+# truss/activities/llm_activity.py
+from temporalio import activity
+# ... other imports ...
+
+@activity.defn(name="LLMCompletion")
+async def llm_activity(
+    agent_config: AgentConfig, 
+    messages: List[Message], 
+    session_id: UUID,
+    run_id: UUID
+) -> Message:
+    """
+    Handles the complete lifecycle of an LLM call: streaming for UI,
+    accumulating for state, and performing a durable, atomic write.
+    """
+    redis_client = get_redis_client() # Assume helper
+    storage = get_postgres_storage() # Assume helper to get a direct storage instance
+    
+    full_content, tool_calls = "", []
+    final_message = None
+
+    try:
+        # 1. Stream from LiteLLM
+        response_stream = await litellm.acompletion(..., stream=True)
+        async for chunk in response_stream:
+            # Heartbeat to Temporal to signal the activity is still alive
+            activity.heartbeat() 
+            
+            # 2. Publish to Redis for UI (Volatile)
+            await redis_client.publish(f"stream:{session_id}", chunk.model_dump_json())
+            
+            # 3. Accumulate in memory for the final result
+            # ... logic to parse chunk and append to full_content/tool_calls ...
+
+        # 4. Assemble the final, complete message object
+        final_message = Message(role="assistant", content=full_content, tool_calls=...)
+
+        # 5. ATOMIC WRITE: Persist the complete message *before* returning.
+        # This is the key to durability. If this DB write fails, the whole activity
+        # fails and Temporal will retry the LLM call. No partial state is ever
+        # returned to the workflow.
+        await storage.create_run_step_from_message(run_id=run_id, message=final_message)
+
+    except Exception as e:
+        activity.logger.error(f"LLM Activity failed: {e}")
+        # Let the exception propagate. Temporal's retry policy will handle it.
+        raise
+
+    return final_message
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+3. Workflow: The Durable Orchestrator
+
+This is where the business logic lives, protected from failures by Temporal.
+
+3.1. TemporalAgentExecutionWorkflow Implementation
+# truss/workflows/agent_workflow.py
+from temporalio import workflow, activity_method, common
+from datetime import timedelta
+import asyncio
+
+# Define a standard retry policy for most activities
+# Non-retryable errors are for things like bad requests (4xx) that will never succeed.
+RETRY_POLICY = common.RetryPolicy(
+    maximum_attempts=5,
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2.0,
+    non_retryable_error_types=["InvalidRequestError", "AuthenticationError"]
+)
+
+@workflow.define
+class TemporalAgentExecutionWorkflow:
+    def __init__(self):
+        # --- State variables for signals and queries ---
+        self.cancellation_requested: bool = False
+        self.current_status: str = "Initializing"
+        self.last_tool_call: Optional[dict] = None
+
+    # --- Signal Handlers (Asynchronous, one-way) ---
+    @workflow.signal
+    def request_cancellation(self):
+        """External signal to gracefully cancel the workflow."""
+        self.cancellation_requested = True
+
+    # --- Query Handlers (Synchronous, read-only) ---
+    @workflow.query
+    def get_status(self) -> str:
+        """Allows external systems to query the current status of the agent's thought process."""
+        return self.current_status
+
+    # --- Main Execution Logic ---
+    @workflow.run
+    async def execute(self, input: AgentWorkflowInput) -> AgentWorkflowOutput:
+        self.current_status = "Starting..."
+        run_id: UUID = None
+
+        # Short timeout activities for DB ops that should be fast
+        storage_opts = {"start_to_close_timeout": timedelta(seconds=10), "retry_policy": RETRY_POLICY}
+        
+        # Longer timeout activities for external calls
+        llm_opts = {"start_to_close_timeout": timedelta(minutes=5), "retry_policy": RETRY_POLICY}
+        tool_opts = {"start_to_close_timeout": timedelta(minutes=2), "retry_policy": RETRY_POLICY}
+
+        try:
+            # --- 1. Initialization and First DB Write ---
+            # ... load agent_config activity ...
+            run_id = await workflow.execute_activity_method(StorageActivities.create_run, args=[input.session_id], **storage_opts)
+            await workflow.execute_activity_method(StorageActivities.create_run_step, args=[run_id, ...], **storage_opts)
+
+            # --- 2. Main Agent Loop ---
+            while True:
+                # Check for cancellation before doing any work
+                if self.cancellation_requested:
+                    raise asyncio.CancelledError("Execution cancelled by signal.")
+
+                self.current_status = "Loading conversation history..."
+                memory = await workflow.execute_activity_method(StorageActivities.get_run_memory, args=[input.session_id], **storage_opts)
+                
+                self.current_status = "Thinking... (Calling LLM)"
+                messages_for_llm = self._construct_prompt(agent_config, memory)
+
+                # The LLM activity handles its own persistence of the assistant message
+                assistant_response = await workflow.execute_activity(
+                    "LLMCompletion", args=[agent_config, messages_for_llm, input.session_id, run_id], **llm_opts
+                )
+
+                # --- 3. Decision Point ---
+                if not assistant_response.tool_calls:
+                    self.current_status = "Task Complete"
+                    break # Exit loop, task is done
+
+                # --- 4. Tool Execution (Parallel) ---
+                self.current_status = f"Executing {len(assistant_response.tool_calls)} tools..."
+                tool_tasks = []
+                for tool_call in assistant_response.tool_calls:
+                    self.last_tool_call = tool_call.model_dump()
+                    task = workflow.execute_activity("ExecuteTool", args=[tool_call], **tool_opts)
+                    tool_tasks.append(task)
+                
+                # Wait for all tools to complete
+                tool_results = await asyncio.gather(*tool_tasks)
+
+                # --- 5. Persist Tool Results ---
+                self.current_status = "Saving tool results..."
+                persist_tasks = []
+                for result in tool_results:
+                    # The message must be saved durably before the next loop iteration
+                    tool_message = Message(role="tool", content=result.content, tool_call_id=result.tool_call_id)
+                    task = workflow.execute_activity_method(StorageActivities.create_run_step, args=[run_id, tool_message], **storage_opts)
+                    persist_tasks.append(task)
+                
+                await asyncio.gather(*persist_tasks)
+                # Loop continues, feeding tool results back to the LLM
+
+            # --- Success Case ---
+            return AgentWorkflowOutput(run_id=run_id, status="completed", final_message=assistant_response)
+
+        except asyncio.CancelledError:
+            # --- Compensation/Rollback for Cancellation ---
+            self.current_status = "Cancelled"
+            # The 'finally' block handles the DB update.
+            raise # Re-raise to let Temporal know it was cancelled.
+
+        except Exception as e:
+            # --- Compensation/Rollback for any other Failure ---
+            self.current_status = f"Failed: {e}"
+            # The 'finally' block handles the DB update.
+            raise ApplicationError(self.current_status) # Raise a non-retryable error to stop the workflow.
+
+        finally:
+            # --- GUARANTEED CLEANUP ---
+            # This block *always* runs, ensuring the DB reflects the final state.
+            # This is the core of the "rollback" logic: we don't undo work,
+            # we record the final outcome, whatever it may be.
+            if run_id:
+                final_status = self.current_status.lower().split(":")[0] # e.g., 'failed' from 'Failed: ...'
+                await workflow.execute_activity_method(
+                    StorageActivities.finalize_run,
+                    args=[run_id, final_status, self.current_status],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RETRY_POLICY
+                )
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+4. Worker and API Setup with Queues
+4.1. Task Queues
+
+We can use different Task Queues for different types of work to isolate them. For example:
+
+truss-agent-queue: For general agent execution.
+
+high-priority-queue: For agents that need faster turnaround.
+
+gpu-inference-queue: If we had local models running on GPU workers.
+
+The worker must listen on the correct queue.
+
+4.2. run_worker.py
+# run_worker.py
+async def main():
+    # ... setup storage, redis, etc. ...
+    
+    # Connect to Temporal
+    client = await Client.connect(os.getenv("TEMPORAL_URL"))
+    
+    # Create worker for the main agent task queue
+    # This worker will handle all the activities and workflows we've defined.
+    worker = Worker(
+        client,
+        task_queue="truss-agent-queue", # CRITICAL: Must match the client call
+        workflows=[TemporalAgentExecutionWorkflow],
+        activities=[...all defined activities...]
+    )
+    await worker.run()
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+4.3. API main.py
+# api.py
+@app.post("/sessions/{session_id}/runs")
+async def start_agent_run(session_id: UUID, body: UserMessageInput):
+    workflow_id = f"run-{uuid4()}"
+    await temporal_client.start_workflow(
+        TemporalAgentExecutionWorkflow.execute,
+        id=workflow_id,
+        task_queue="truss-agent-queue", # CRITICAL: Specifies which worker pool should pick this up
+        args=[...]
+    )
+    return {"workflow_id": workflow_id}
+
+@app.get("/workflows/{workflow_id}/status")
+async def get_workflow_status(workflow_id: str):
+    """Example of using a Query."""
+    handle = temporal_client.get_workflow_handle(workflow_id)
+    status = await handle.query(TemporalAgentExecutionWorkflow.get_status)
+    return {"workflow_id": workflow_id, "status": status}
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END

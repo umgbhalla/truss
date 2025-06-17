@@ -1,0 +1,373 @@
+
+High-Level Technical Design: Truss Agent Execution Platform
+
+This document outlines the technical implementation details for the Truss platform, focusing on the interactions between classes, the signatures of key functions, and the logic flow within the Temporal environment.
+
+1. Core Data Structures
+1.1. Pydantic Data Models (truss/data_models.py)
+
+These models serve as the data contracts for all API and Workflow/Activity interactions. They are the "lingua franca" of the system.
+
+# truss/data_models.py
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+
+class AgentMemory(BaseModel):
+    messages: List[Message]
+
+class AgentConfig(BaseModel):
+    id: UUID
+    name: str
+    system_prompt: str
+    llm_config: LLMConfig # Contains model, temp, etc.
+    tools: List[ToolDefinition]
+
+class AgentWorkflowInput(BaseModel):
+    session_id: UUID
+    user_message: str
+
+class AgentWorkflowOutput(BaseModel):
+    run_id: UUID
+    status: Literal["completed", "failed", "cancelled"]
+    final_message: Optional[Message] = None
+
+1.2. SQLAlchemy Models (truss/core/models/base.py)
+
+These define the persistent state in Postgres. They are intentionally kept separate from the Pydantic models to decouple the application logic from the database schema.
+
+# truss/core/models/base.py
+
+class RunStep(Base):
+    __tablename__ = 'run_steps'
+    id = Column(UUID, primary_key=True, default=uuid4)
+    run_id = Column(UUID, ForeignKey('runs.id'), nullable=False)
+    role = Column(String, nullable=False)
+    content = Column(Text)
+    tool_calls = Column(JSONB) # Stored as JSON
+    tool_call_id = Column(String)
+    # ... timestamps ...
+
+# Other models (Run, RunSession, AgentConfig) as defined in the PRD.
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+2. Activities: The "Work" Layer
+
+Activities are functions that interact with the outside world. They are designed to be idempotent where possible and handle their own dependencies (like database connections).
+
+2.1. Storage Activities (truss/activities/storage_activities.py)
+
+A single class StorageActivities will encapsulate all database operations. An instance of PostgresStorage will be injected at worker startup.
+
+# truss/activities/storage_activities.py
+from temporalio import activity
+
+class StorageActivities:
+    def __init__(self, storage: PostgresStorage):
+        self.storage = storage
+
+    @activity.defn
+    async def create_run(self, session_id: UUID) -> UUID:
+        # ... uses self.storage to insert a new Run ...
+        return run.id
+
+    @activity.defn
+    async def create_run_step(self, run_id: UUID, message: Message) -> UUID:
+        # ... uses self.storage to insert a new RunStep from a Message object ...
+        return run_step.id
+
+    @activity.defn
+    async def get_run_memory(self, session_id: UUID) -> AgentMemory:
+        # 1. Query all RunSteps for the session, ordered by creation time.
+        # 2. Convert each SQLAlchemy RunStep object into a Pydantic Message object.
+        # 3. Return as AgentMemory(messages=[...]).
+        pass
+
+    @activity.defn
+    async def load_agent_config(self, agent_id: UUID) -> AgentConfig:
+        # 1. Query the agent_configs table.
+        # 2. Convert the SQLAlchemy result into a Pydantic AgentConfig object.
+        pass
+
+    @activity.defn
+    async def finalize_run(self, run_id: UUID, status: str, error: Optional[str] = None):
+        # ... uses self.storage to update a Run's status and error message ...
+        pass
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+2.2. LLM Activity (truss/activities/llm_activities.py)
+
+This activity is the sole interface to language models.
+
+# truss/activities/llm_activities.py
+
+@activity.defn
+async def llm_activity(
+    agent_config: AgentConfig, 
+    messages: List[Message], 
+    session_id: UUID, # For Redis stream key
+    run_id: UUID      # For durable persistence
+) -> Message:
+    # 1. Initialize LiteLLM call parameters from agent_config.
+    # 2. Initialize Redis client.
+    # 3. Initialize accumulators for final response: `full_content`, `full_tool_calls`.
+    
+    # 4. Begin `litellm.acompletion(..., stream=True)` call.
+    # 5. In the async for loop over chunks:
+    #    a. Publish the raw chunk to Redis channel `stream:{session_id}`.
+    #    b. Parse the chunk and append to `full_content` or `full_tool_calls`.
+    
+    # 6. After the loop, assemble the final, complete Pydantic `Message` object.
+    
+    # 7. CRITICAL: Directly call a non-activity storage function to persist this final Message as a RunStep.
+    #    This makes the entire operation atomic.
+    #    storage = get_default_storage()
+    #    storage.create_run_step_sync(run_id=run_id, message=final_message)
+    
+    # 8. Return the final Message object to the workflow.
+    #    If any step fails (LLM call, DB write), the exception propagates and Temporal retries the whole activity.
+    pass
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+2.3. Tool Activity (truss/activities/tool_activities.py)
+
+A generic router for all tool execution.
+
+# truss/activities/tool_activities.py
+
+# --- Tool Implementations (example) ---
+async def _execute_web_search(query: str) -> dict:
+    # ... call Serper/Google API ...
+    return {"results": "..."}
+
+async def _execute_get_stock_price(ticker_symbol: str) -> dict:
+    # ... call financial API ...
+    return {"price": 150.0}
+
+# --- The Router Map ---
+TOOL_REGISTRY = {
+    "web_search": _execute_web_search,
+    "get_stock_price": _execute_get_stock_price,
+}
+
+@activity.defn
+async def execute_tool_activity(tool_call: ToolCall) -> ToolCallResult:
+    # 1. Get function name and arguments from the tool_call object.
+    function_name = tool_call.function.name
+    arguments = json.loads(tool_call.function.arguments)
+
+    # 2. Look up the function in TOOL_REGISTRY.
+    if function_name not in TOOL_REGISTRY:
+        raise ApplicationError(f"Tool '{function_name}' not found.")
+    
+    # 3. Execute the function with the arguments.
+    tool_function = TOOL_REGISTRY[function_name]
+    result_content = await tool_function(**arguments)
+    
+    # 4. Return the result packaged in a ToolCallResult object.
+    return ToolCallResult(
+        tool_call_id=tool_call.id,
+        content=json.dumps(result_content)
+    )
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+3. Workflow: The "Orchestration" Layer
+
+The workflow ties all the activities together. It contains no I/O, only orchestration logic.
+
+3.1. TemporalAgentExecutionWorkflow (truss/workflows/agent_workflow.py)
+# truss/workflows/agent_workflow.py
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+from datetime import timedelta
+
+@workflow.define
+class TemporalAgentExecutionWorkflow:
+    def __init__(self):
+        # Signal state variables
+        self.cancellation_requested = False
+        # ... other signal states ...
+
+    # --- Signal Handlers ---
+    @workflow.signal
+    def request_cancellation(self):
+        self.cancellation_requested = True
+
+    # --- Main Execution Method ---
+    @workflow.run
+    async def execute(self, input: AgentWorkflowInput) -> AgentWorkflowOutput:
+        run_id: UUID = None
+        final_status = "failed"
+        error_message = None
+
+        # Define standard retry policies for activities
+        default_retry = RetryPolicy(maximum_attempts=3)
+
+        try:
+            # --- 1. Initialization ---
+            session_data = await workflow.execute_activity(
+                # Fetch agent_id from session
+            ) 
+            agent_config = await workflow.execute_activity(
+                load_agent_config_activity, args=[session_data.agent_id], retry_policy=default_retry
+            )
+            run_id = await workflow.execute_activity(
+                create_run, args=[input.session_id], retry_policy=default_retry
+            )
+            await workflow.execute_activity(
+                create_run_step, args=[run_id, Message(role="user", content=input.user_message)], retry_policy=default_retry
+            )
+
+            # --- 2. Main Agent Loop ---
+            while True: # Loop for tool calls
+                if self.cancellation_requested:
+                    raise asyncio.CancelledError("Cancellation requested by signal.")
+
+                # Load memory for this turn
+                memory = await workflow.execute_activity(
+                    get_run_memory_activity, args=[input.session_id], retry_policy=default_retry
+                )
+
+                # Construct messages including system prompt
+                messages_for_llm = [Message(role="system", content=agent_config.system_prompt)] + memory.messages
+
+                # Call LLM
+                assistant_response = await workflow.execute_activity(
+                    llm_activity,
+                    args=[agent_config, messages_for_llm, input.session_id, run_id],
+                    start_to_close_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=5)
+                )
+
+                # --- 3. Decision Logic ---
+                if not assistant_response.tool_calls:
+                    # Final text response, exit loop
+                    final_status = "completed"
+                    break
+                
+                # --- 4. Tool Execution ---
+                tool_results = []
+                for tool_call in assistant_response.tool_calls:
+                    tool_result = await workflow.execute_activity(
+                        execute_tool_activity,
+                        args=[tool_call],
+                        start_to_close_timeout=timedelta(minutes=1),
+                        retry_policy=default_retry
+                    )
+                    tool_results.append(tool_result)
+
+                # Persist tool results to the database
+                for res in tool_results:
+                    await workflow.execute_activity(
+                        create_run_step,
+                        args=[run_id, Message(role="tool", content=res.content, tool_call_id=res.tool_call_id)],
+                        retry_policy=default_retry
+                    )
+                # The loop continues, sending tool results back to the LLM.
+
+        except asyncio.CancelledError:
+            final_status = "cancelled"
+        except ActivityError as e:
+            final_status = "failed"
+            error_message = str(e)
+        finally:
+            # --- 5. Finalization ---
+            # This block is guaranteed to run.
+            if run_id:
+                await workflow.execute_activity(
+                    finalize_run, args=[run_id, final_status, error_message], retry_policy=RetryPolicy(maximum_attempts=10)
+                )
+
+        if final_status != "completed":
+            raise ApplicationError(f"Workflow finished with status: {final_status}. Reason: {error_message}")
+            
+        return AgentWorkflowOutput(run_id=run_id, status=final_status, final_message=assistant_response)
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+4. Worker and API Setup
+4.1. Worker Entrypoint (run_worker.py)
+# run_worker.py
+async def main():
+    # 1. Initialize DB connection -> `PostgresStorage`
+    storage = PostgresStorage(db_url=os.getenv("DATABASE_URL"))
+    
+    # 2. Initialize Activity classes with dependencies
+    storage_activities = StorageActivities(storage)
+    # llm_activities and tool_activities are mostly functional, no init needed
+    
+    # 3. Connect to Temporal
+    client = await Client.connect(os.getenv("TEMPORAL_URL"))
+    
+    # 4. Create and run the worker
+    worker = Worker(
+        client,
+        task_queue="truss-agent-queue",
+        workflows=[TemporalAgentExecutionWorkflow],
+        activities=[
+            *storage_activities.get_all_activities(), # A helper method to list all @activity.defn
+            llm_activity,
+            execute_tool_activity
+        ]
+    )
+    await worker.run()
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
+4.2. API Entrypoint (e.g., using FastAPI)
+# api.py
+app = FastAPI()
+temporal_client = None # Initialized on startup
+
+@app.on_event("startup")
+async def startup_event():
+    global temporal_client
+    temporal_client = await Client.connect(os.getenv("TEMPORAL_URL"))
+
+@app.post("/sessions/{session_id}/runs", status_code=202)
+async def start_agent_run(session_id: UUID, body: UserMessageInput):
+    workflow_id = f"run-{uuid4()}"
+    await temporal_client.start_workflow(
+        TemporalAgentExecutionWorkflow.execute,
+        id=workflow_id,
+        task_queue="truss-agent-queue",
+        args=[AgentWorkflowInput(session_id=session_id, user_message=body.message)]
+    )
+    return {"workflow_id": workflow_id}
+
+@app.post("/workflows/{workflow_id}/signal/{signal_name}")
+async def send_signal_to_workflow(workflow_id: str, signal_name: str, body: dict):
+    handle = temporal_client.get_workflow_handle(workflow_id)
+    await handle.signal(signal_name, body.get("data"))
+    return {"status": "signal sent"}
+IGNORE_WHEN_COPYING_START
+content_copy
+download
+Use code with caution.
+Python
+IGNORE_WHEN_COPYING_END
