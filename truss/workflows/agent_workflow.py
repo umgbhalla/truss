@@ -189,7 +189,7 @@ class TemporalAgentExecutionWorkflow:
                         "ExecuteTool",
                         args=[tool_call, [ mcp_server 
                                           for mcp_server in agent_config.get("mcp_servers") 
-                                          if tool_call.name in server_tools[mcp_server["name"]]
+                                          if tool_call.name in [t["function"]["name"] for t in server_tools[mcp_server["name"]]]
                                           ][0]
                               ],
                         result_type=ToolCallResult,
