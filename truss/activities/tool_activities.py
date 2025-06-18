@@ -49,7 +49,7 @@ async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str,
                     "function": {
                         "name": getattr(t, "name", ""),
                         "description": getattr(t, "description", "") or "",
-                        "parameters": getattr(t, "inputSchema", {"type": "object", "properties": {}}) or {"type": "object", "properties": {}},
+                        "parameters": (lambda s: s if s and s.get("type") != "object" or "properties" in s else {**s, "properties": {}})(getattr(t, "inputSchema", {})),
                     },
                 }
                 for t in all_remote_tools
