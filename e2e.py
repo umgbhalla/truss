@@ -5,7 +5,6 @@ import os
 from functools import lru_cache
 from typing import Optional
 
-from fastapi import HTTPException
 from sqlalchemy import UUID
 from temporalio.client import Client, TLSConfig  # type: ignore
 
@@ -73,13 +72,21 @@ async def main():
 
   # create agent 
   mcp_list = get_storage().list_mcp_server_configs()
-  if "sqlite" not in [mcp.name for mcp in mcp_list]:
+  # if "sqlite" not in [mcp.name for mcp in mcp_list]:
+  #   get_storage().create_mcp_server_config(**dict(
+  #     name="sqlite",
+  #     command="uvx",
+  #     args= ["mcp-server-sqlite", "--db-path", "test.db"],
+  #     enabled=True,
+  #   ))
+  if "mcp-cf" not in [mcp.name for mcp in mcp_list]:
     get_storage().create_mcp_server_config(**dict(
-      name="sqlite",
-      command="uvx",
-      args= ["mcp-server-sqlite", "--db-path", "test.db"],
+      name="mcp-cf",
+      command="npx",
+      args= ["-y", "mcp-remote", "https://docs.mcp.cloudflare.com/sse"],
       enabled=True,
     ))
+  
     
   agent_list = get_storage().list_agent_configs()
   agent_list = [dict(id=str(o.id),
@@ -88,14 +95,14 @@ async def main():
             llm_config=o.llm_config, 
             mcp_servers=o.mcp_servers,) for o in agent_list]
   print(agent_list)
-  if "r2" not in [agent["name"] for agent in agent_list]:
+  if "r247" not in [agent["name"] for agent in agent_list]:
     agent_config_orm = get_storage().create_agent_config(
-      name="r2",
+      name="r247",
       system_prompt="You are a helpful assistant that can answer questions about the SQLite database.",
       llm_config={
         "model_name": "openrouter/openai/gpt-4.1-mini",
       },
-      mcp_servers=["sqlite"],
+      mcp_servers=["mcp-cf"],
     )
     agent_config = {
         "id": str(agent_config_orm.id),
@@ -124,7 +131,7 @@ async def main():
           TemporalAgentExecutionWorkflow.execute,
           id=session_id,  
           task_queue="truss-agent-queue",
-          args=[{"session_id": session_id, "user_message": "can u describe the tables in this database?", "agent_config": agent_config}],
+          args=[{"session_id": session_id, "user_message": "can u show me what docs we can search?", "agent_config": agent_config}],
       )
   except Exception as exc:
       logger.warning(

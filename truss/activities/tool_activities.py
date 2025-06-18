@@ -43,17 +43,26 @@ async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str,
                 logger.warning(f"Failed to introspect tools from MCP server {mcp_server.get('name')}: {e}")
 
         if all_remote_tools:
-            tools_payload = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": getattr(t, "name", ""),
-                        "description": getattr(t, "description", "") or "",
-                        "parameters": (lambda s: s if s and s.get("type") != "object" or "properties" in s else {**s, "properties": {}})(getattr(t, "inputSchema", {})),
-                    },
-                }
-                for t in all_remote_tools
-            ]
+            processed_tools = []
+            for t in all_remote_tools:
+                input_schema = getattr(t, "inputSchema", {})
+                # Ensure the parameters schema is a valid JSON schema for objects
+                if not input_schema or (input_schema.get("type") == "object" and "properties" not in input_schema):
+                    parameters = {"type": "object", "properties": {}}
+                else:
+                    parameters = input_schema
+
+                processed_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": getattr(t, "name", ""),
+                            "description": getattr(t, "description", "") or "",
+                            "parameters": parameters,
+                        },
+                    }
+                )
+            tools_payload = processed_tools
             
     return tools_payload, server_tools
 

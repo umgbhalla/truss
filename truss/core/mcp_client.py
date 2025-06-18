@@ -17,7 +17,7 @@ from typing import Dict
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
-from mcp import ClientSession, StdioServerParameters
+from mcp import StdioServerParameters
 
 
 from truss.data_models import MCPClientConfig, MCPServerConfig
