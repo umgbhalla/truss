@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Tuple
 from temporalio import activity
 
 from truss.core.mcp_client import default_manager
-from truss.data_models import ToolCall, ToolCallResult, MCPServerConfig, AgentConfig
+from truss.data_models import ToolCall, ToolCallResult, MCPServerConfig
 import logging
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str,
                     "function": {
                         "name": getattr(t, "name", ""),
                         "description": getattr(t, "description", "") or "",
-                        "parameters": getattr(t, "inputSchema", {}),
+                        "parameters": getattr(t, "inputSchema", {"type": "object", "properties": {}}) or {"type": "object", "properties": {}},
                     },
                 }
                 for t in all_remote_tools
