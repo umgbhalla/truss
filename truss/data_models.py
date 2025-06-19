@@ -7,7 +7,7 @@ subtasks will flesh out the individual models.
 
 from __future__ import annotations
 from pydantic import BaseModel
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, NotRequired, TypedDict
 from uuid import uuid4
 from pydantic import Field
 
@@ -22,6 +22,7 @@ __all__ = [
     "MCPClientConfig",
     "AgentWorkflowInput",
     "AgentWorkflowOutput",
+    "SandboxOptions",
 ]
 
 
@@ -127,11 +128,14 @@ class MCPServerConfig(BaseModel):
     """Configuration entry describing how to launch/connect to an MCP server."""
 
     name: str = Field(..., description="Unique logical identifier (e.g. 'local-sqlite')")
-    command: str = Field(..., description="Executable/command to start the server")
-    args: List[str] = Field(default_factory=list, description="Command-line arguments")
+    command: Optional[str] = Field(default=None, description="Executable/command to start the server")
+    args: Optional[List[str]] = Field(default=None, description="Command-line arguments")
     env: Optional[dict[str, str]] = Field(default=None, description="Additional environment variables")
     description: Optional[str] = Field(default=None, description="Optional human friendly description")
-    enabled: bool = Field(default=True, description="Whether this server can be used by agents")
+    url : Optional[str] = Field(default=None, description="URL of the MCP server")
+    ws_url : Optional[str] = Field(default=None, description="WebSocket URL of the MCP server")
+    headers : Optional[dict[str, str]] = Field(default=None, description="Headers to send to the MCP server")
+    auth_token : Optional[str] = Field(default=None, description="Authentication token to use for the MCP server")
 
 
 class MCPClientConfig(BaseModel):
@@ -196,3 +200,23 @@ class AgentWorkflowOutput(BaseModel):
         default=None,
         description="Error description if status == 'errored'",
     ) 
+
+
+class SandboxOptions(TypedDict):
+    """Configuration options for sandbox execution.
+
+    This type defines the configuration options available when running
+    MCP servers in a sandboxed environment (e.g., using E2B).
+    """
+
+    api_key: str
+    """Direct API key for sandbox provider (e.g., E2B API key).
+    If not provided, will use E2B_API_KEY environment variable."""
+
+    sandbox_template_id: NotRequired[str]
+    """Template ID for the sandbox environment.
+    Default: 'base'"""
+
+    supergateway_command: NotRequired[str]
+    """Command to run supergateway.
+    Default: 'npx -y supergateway'"""

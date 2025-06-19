@@ -80,6 +80,4 @@ class MCPClientManager:
         self._sessions.clear()
 
 
-def default_manager() -> MCPClientManager: 
-    """Return the lazily instantiated :class:`MCPClientManager` singleton."""
-    return MCPClientManager()
+default_manager = MCPClientManager()

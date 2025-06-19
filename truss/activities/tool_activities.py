@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Tuple
+import asyncio
 
 from temporalio import activity
 
-from truss.core.mcp_client import default_manager
-from truss.data_models import ToolCall, ToolCallResult, MCPServerConfig
+from truss.core.client import MCPClient
+from truss.core.connectors import BaseConnector
+from truss.data_models import ToolCall, ToolCallResult
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,35 @@ handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(filename)s - %(lineno)d - %(message)s'))
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+# Singleton MCP client managing connectors for all servers
+_mcp_client = MCPClient()
+
+# Lock guarding first-time session creation so multiple concurrent activities
+# don't race when the same server is referenced the very first time.
+_session_lock: asyncio.Lock = asyncio.Lock()
+
+async def _get_connector(server_cfg: dict) -> "BaseConnector":  # noqa: F821 – forward ref
+    """Return an initialised connector for *server_cfg*.
+
+    A session is created lazily on first access and re-used afterwards.  The
+    function always returns the connector instance (rather than the
+    MCPSession) so callers can directly use  ``list_tools`` / ``call_tool``.
+    """
+
+    name = server_cfg["name"]
+
+    # Fast path – already cached
+    if name in _mcp_client.sessions:
+        return _mcp_client.get_session(name).connector
+
+    # Slow path – create & initialise under lock
+    async with _session_lock:
+        if name not in _mcp_client.sessions:  # re-check after awaiting lock
+            _mcp_client.add_server(name, server_cfg)
+            await _mcp_client.create_session(name, auto_initialize=True)
+
+        return _mcp_client.get_session(name).connector
 
 @activity.defn(name="GetTools")
 async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -32,20 +63,33 @@ async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str,
     if agent_config.get("mcp_servers"):
         for mcp_server in agent_config["mcp_servers"]:
             try:
-                server_config = MCPServerConfig(**mcp_server)
-                session = await default_manager().get_session(server_config)
-                remote_tools_resp = await session.list_tools()
-                if remote_tools_resp:
-                    tools_for_server = getattr(remote_tools_resp, "tools", [])
-                    server_tools[mcp_server["name"]] = tools_for_server
-                    all_remote_tools.extend(tools_for_server)
+                connector = await _get_connector(mcp_server)
+                remote_tools = await connector.list_tools()
+                if remote_tools:
+                    # Convert Tool objects to plain dicts so downstream code that
+                    # expects subscriptable items (e.g. t["name"]) keeps working.
+                    remote_tools_dicts = [t.__dict__ if hasattr(t, "__dict__") else t for t in remote_tools]
+                    server_tools[mcp_server["name"]] = remote_tools_dicts
+                    all_remote_tools.extend(remote_tools_dicts)
             except Exception as e:
-                logger.warning(f"Failed to introspect tools from MCP server {mcp_server.get('name')}: {e}")
+                logger.warning(
+                    "Failed to introspect tools from MCP server %s: %s",
+                    mcp_server.get("name"),
+                    e,
+                )
 
         if all_remote_tools:
             processed_tools = []
             for t in all_remote_tools:
-                input_schema = getattr(t, "inputSchema", {})
+                if isinstance(t, dict):
+                    input_schema = t.get("inputSchema", {})
+                    name = t.get("name", "")
+                    description = t.get("description", "") or ""
+                else:  # fallback to attribute style
+                    input_schema = getattr(t, "inputSchema", {})
+                    name = getattr(t, "name", "")
+                    description = getattr(t, "description", "") or ""
+
                 # Ensure the parameters schema is a valid JSON schema for objects
                 if not input_schema or (input_schema.get("type") == "object" and "properties" not in input_schema):
                     parameters = {"type": "object", "properties": {}}
@@ -56,8 +100,8 @@ async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str,
                     {
                         "type": "function",
                         "function": {
-                            "name": getattr(t, "name", ""),
-                            "description": getattr(t, "description", "") or "",
+                            "name": name,
+                            "description": description,
                             "parameters": parameters,
                         },
                     }
@@ -69,7 +113,7 @@ async def get_tools(agent_config: dict) -> Tuple[List[Dict[str, Any]], Dict[str,
 @activity.defn(name="ExecuteTool")
 async def execute_tool_activity(  # noqa: D401 – imperative style
     tool_call: ToolCall,
-    mcp_server_config: MCPServerConfig,  
+    mcp_server_config: dict,  
 ) -> ToolCallResult:
     """Proxy *tool_call* execution to the given *mcp_server*.
 
@@ -81,10 +125,9 @@ async def execute_tool_activity(  # noqa: D401 – imperative style
         Logical name of the MCP server to use.
     """
     try:
-        session = await default_manager().get_session(mcp_server_config)
+        connector = await _get_connector(mcp_server_config)
 
-        
-        mcp_result = await session.call_tool(tool_call.name, tool_call.arguments)  
+        mcp_result = await connector.call_tool(tool_call.name, tool_call.arguments)  
         def _serialise_part(part: Any) -> str:
             if getattr(part, "type", "text") == "text":
                 return str(getattr(part, "text", part))

@@ -224,3 +224,5 @@ tasks/
 .roo/*
 .roo*
 *json
+**/node_modules/*
+

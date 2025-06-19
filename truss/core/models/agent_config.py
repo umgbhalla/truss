@@ -13,7 +13,6 @@ from datetime import datetime
 from sqlalchemy import Column, DateTime, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import JSON
-from sqlalchemy import ForeignKey
 from typing import Any
 
 from .base import Base

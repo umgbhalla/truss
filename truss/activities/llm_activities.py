@@ -17,9 +17,8 @@ import anyio
 import redis.asyncio as redis
 from temporalio import activity
 from truss.core.llm_client import stream_completion
-from truss.core.mcp_client import default_manager
 from truss.core.storage import PostgresStorage
-from truss.data_models import Message, ToolCall, MCPClientConfig, MCPServerConfig
+from truss.data_models import Message, ToolCall
 
 from truss.settings import get_settings
 from anyio import to_thread

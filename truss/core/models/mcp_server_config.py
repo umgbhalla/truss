@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Column, String, Boolean, Text, DateTime, JSON
+from sqlalchemy import Column, String, Text, DateTime, JSON
 from sqlalchemy.dialects.postgresql import UUID
 
 from .base import Base
@@ -25,17 +25,21 @@ class MCPServerConfigORM(Base):  # noqa: D101 – naming constrained by spec
     # Human-readable unique identifier (not a UUID) – e.g. "local-sqlite", "prod-delta".
     name = Column(String(length=128), primary_key=True, nullable=False)
 
-    command = Column(String(length=255), nullable=False)
-    args = Column(JSON, nullable=False, default=list)  # list[str]
+    command = Column(String(length=255), nullable=True)
+    args = Column(JSON, nullable=True, default=list)  # list[str]
     env = Column(JSON, nullable=True)
     description = Column(Text, nullable=True)
-    enabled = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    url = Column(String(length=255), nullable=True)
+    ws_url = Column(String(length=255), nullable=True)
+    headers = Column(JSON, nullable=True)
+    auth_token = Column(String(length=255), nullable=True)
+
     def __repr__(self) -> str:  # pragma: no cover
-        return f"<MCPServerConfigORM name={self.name!r} enabled={self.enabled}>" 
+        return f"<MCPServerConfigORM name={self.name!r}>" 
 
     def _to_dict(self) -> dict[str, Any]:
         return {
@@ -44,5 +48,8 @@ class MCPServerConfigORM(Base):  # noqa: D101 – naming constrained by spec
             "args": self.args,
             "env": self.env,
             "description": self.description,
-            "enabled": self.enabled,
+            "url": self.url,
+            "ws_url": self.ws_url,
+            "headers": self.headers,
+            "auth_token": self.auth_token,
         }   

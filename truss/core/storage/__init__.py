@@ -20,7 +20,7 @@ from truss.core.models.mcp_server_config import MCPServerConfigORM
 from truss.core.models.run import RunORM, RunStatus
 from truss.core.models.run_session import RunSessionORM
 from truss.core.models.run_step import RunStepORM, MessageRole
-from truss.data_models import Message, AgentConfig, MCPServerConfig
+from truss.data_models import Message, AgentConfig
 
 
 class PostgresStorage:  
@@ -202,11 +202,23 @@ class PostgresStorage:
                 raise KeyError(f"AgentConfig {agent_id} not found")
             session.delete(obj)
 
-    def create_mcp_server_config(self, *,name: str, command: str, args: list[str], enabled: bool) -> MCPServerConfigORM:
+    def create_mcp_server_config(self, **kwargs: Any) -> MCPServerConfigORM:
+        """Insert a new MCPServerConfig row.
+
+        Accepts flexible keyword arguments so callers can specify only the
+        fields relevant for the chosen transport (e.g. *url* for HTTP, or
+        *command* / *args* for stdio). 
+        """
+
+        if "name" not in kwargs:
+            raise TypeError("create_mcp_server_config() missing required argument: 'name'")
+
+
         with self._session_scope() as session:
-            if session.get(MCPServerConfigORM, name):
-                raise ValueError(f"MCPServerConfig '{name}' already exists")
-            obj = MCPServerConfigORM(name=name, command=command, args=args, enabled=enabled)  
+            if session.get(MCPServerConfigORM, kwargs["name"]):
+                raise ValueError(f"MCPServerConfig '{kwargs['name']}' already exists")
+
+            obj = MCPServerConfigORM(**kwargs)  # type: ignore[arg-type]
             session.add(obj)
             session.flush()
             session.refresh(obj)
